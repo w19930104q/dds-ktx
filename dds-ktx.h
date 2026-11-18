@@ -73,6 +73,9 @@
 //      1.1.0       Fixed bugs in get_sub routine, refactored some parts, image-viewer example
 //      1.2.0       Improved support for DirectX XRGB formats
 //      1.2.1       Fixed two exploit bugs
+//      1.3.0       Unified block footprint/row-pitch calculation (non-4x4 block
+//                  formats and non-multiple-of-4 dimensions), mip-chain and
+//                  file-length validation at parse time, KTX imageSize checks
 //
 // TODO
 //      Write KTX/DDS
@@ -469,7 +472,6 @@ typedef struct ddsktx__block_info
 
 #define ddsktx__max(a, b)                  ((a) > (b) ? (a) : (b))
 #define ddsktx__min(a, b)                  ((a) < (b) ? (a) : (b))
-#define ddsktx__align_mask(_value, _mask)  (((_value)+(_mask)) & ((~0)&(~(_mask))))
 #define ddsktx__err(_err, _msg)            if (_err)  ddsktx_strcpy(_err->msg, _msg);   return false
 
 static const ddsktx__dds_translate_fourcc_format k__translate_dds_fourcc[] = {
@@ -902,6 +904,143 @@ static inline int ddsktx__read(ddsktx__mem_reader* reader, void* buff, int size)
     return read_bytes;
 }
 
+// Dimension of a mip level: each level halves the base dimension and clamps to 1.
+static inline int ddsktx__mip_dim(int base_dim, int mip)
+{
+    int dim = base_dim >> mip;
+    return dim > 0 ? dim : 1;
+}
+
+// Maximum legal number of mip levels for a texture (1x1 is always the last level).
+static inline int ddsktx__max_mips(int width, int height, int depth)
+{
+    int max_dim = ddsktx__max(width, ddsktx__max(height, depth));
+    int mips = 1;
+    while (max_dim > 1) {
+        max_dim >>= 1;
+        ++mips;
+    }
+    return mips;
+}
+
+//
+// Calculates the storage footprint of a single 2D face/slice of a mip level.
+// Works for every format in ddsktx_format:
+//   - Compressed formats store data in fixed-size blocks (e.g. 4x4 for BC/ETC,
+//     5x5 for ASTC5x5, 8x4 for PVRTC 2bpp). Widths/heights that are not a
+//     multiple of the block dimensions are padded up to the next whole block,
+//     with a format-specific minimum block count.
+//   - Uncompressed formats are packed rows of 'bpp' bits per pixel.
+// All results are 64-bit so malformed (huge) header dimensions cannot overflow.
+//
+typedef struct ddsktx__footprint
+{
+    int64_t row_pitch_bytes;   // bytes per row of blocks (or per pixel-row)
+    int64_t slice_size_bytes;  // bytes of one whole 2D face/slice
+    int     width;             // logical mip width
+    int     height;            // logical mip height
+} ddsktx__footprint;
+
+static ddsktx__footprint ddsktx__calc_footprint(ddsktx_format format, int width, int height)
+{
+    ddsktx__footprint fp;
+    fp.width = width;
+    fp.height = height;
+
+    const ddsktx__block_info* binfo = &k__block_info[format];
+    if (format < _DDSKTX_FORMAT_COMPRESSED) {
+        int num_blocks_wide  = ddsktx__max((int)binfo->min_block_x,
+                                           (width  + binfo->block_width  - 1) / binfo->block_width);
+        int num_blocks_high  = ddsktx__max((int)binfo->min_block_y,
+                                           (height + binfo->block_height - 1) / binfo->block_height);
+        fp.row_pitch_bytes  = (int64_t)num_blocks_wide * binfo->block_size;
+        fp.slice_size_bytes = fp.row_pitch_bytes * num_blocks_high;
+    } else {
+        fp.row_pitch_bytes  = ((int64_t)width * binfo->bpp + 7) / 8; // round up to whole bytes
+        fp.slice_size_bytes = fp.row_pitch_bytes * height;
+    }
+    return fp;
+}
+
+static inline int64_t ddsktx__align64(int64_t value, int64_t alignment)
+{
+    return (value + (alignment - 1)) & ~(alignment - 1);
+}
+
+//
+// Walks the whole mip chain of a parsed DDS texture and verifies that it fits
+// inside the file. DDS stores no per-mip headers or padding: layers, then cube
+// faces, then mips, then depth slices, back to back.
+//
+static bool ddsktx__validate_dds_layout(const ddsktx_texture_info* tc, ddsktx_error* err)
+{
+    const int num_faces = (tc->flags & DDSKTX_TEXTURE_FLAG_CUBEMAP) ? DDSKTX_CUBE_FACE_COUNT : 1;
+    const int64_t data_size = (int64_t)tc->size_bytes;
+    int64_t offset = 0;
+
+    for (int layer = 0; layer < tc->num_layers; ++layer) {
+        for (int face = 0; face < num_faces; ++face) {
+            for (int mip = 0; mip < tc->num_mips; ++mip) {
+                int mip_w = ddsktx__mip_dim(tc->width, mip);
+                int mip_h = ddsktx__mip_dim(tc->height, mip);
+                int num_slices = (tc->flags & DDSKTX_TEXTURE_FLAG_VOLUME)
+                               ? ddsktx__mip_dim(tc->depth, mip) : 1;
+                ddsktx__footprint fp = ddsktx__calc_footprint(tc->format, mip_w, mip_h);
+                offset += fp.slice_size_bytes * num_slices;
+                if (offset > data_size) {
+                    ddsktx__err(err, "dds: texture data is smaller than the declared mip chain");
+                }
+            }
+        }
+    }
+    return true;
+}
+
+//
+// Walks the whole mip chain of a parsed KTX texture and verifies it. Each mip
+// level starts with a uint32 imageSize, followed by per-layer/per-face data
+// blocks (a 3D level includes all its depth slices). imageSize is the stored
+// stride between faces: the KTX spec rounds it up to a multiple of 4, so it is
+// at least the tightly-packed face size and at most 3 bytes larger. The
+// sub-resource itself stays tightly packed inside that stride (see get_sub).
+//
+static bool ddsktx__validate_ktx_layout(ddsktx_texture_info* tc, const void* file_data,
+                                        int size, ddsktx_error* err)
+{
+    const int num_faces = (tc->flags & DDSKTX_TEXTURE_FLAG_CUBEMAP) ? DDSKTX_CUBE_FACE_COUNT : 1;
+    ddsktx__mem_reader r = {(const uint8_t*)file_data, size, tc->data_offset};
+
+    for (int mip = 0; mip < tc->num_mips; ++mip) {
+        int mip_w = ddsktx__mip_dim(tc->width, mip);
+        int mip_h = ddsktx__mip_dim(tc->height, mip);
+        int num_slices = (tc->flags & DDSKTX_TEXTURE_FLAG_VOLUME)
+                       ? ddsktx__mip_dim(tc->depth, mip) : 1;
+        ddsktx__footprint fp = ddsktx__calc_footprint(tc->format, mip_w, mip_h);
+        int64_t face_size = fp.slice_size_bytes * num_slices;
+
+        uint32_t image_size = 0;
+        if (ddsktx__read(&r, &image_size, sizeof(image_size)) != sizeof(image_size)) {
+            ddsktx__err(err, "ktx: unexpected end of file while reading mip size");
+        }
+        // imageSize covers one array element / one cube face (all depth slices
+        // of a 3D level), optionally padded up to a multiple of 4.
+        int64_t padded = ddsktx__align64(face_size, 4);
+        if ((int64_t)image_size < face_size || (int64_t)image_size > padded) {
+            ddsktx__err(err, "ktx: mip image size does not match format dimensions");
+        }
+
+        for (int layer = 0; layer < tc->num_layers; ++layer) {
+            for (int face = 0; face < num_faces; ++face) {
+                if ((int64_t)r.offset + image_size > r.total) {
+                    ddsktx__err(err, "ktx: texture data is smaller than the declared mip chain");
+                }
+                r.offset += (int)image_size;
+            }
+        }
+    }
+    return true;
+}
+
 static bool ddsktx__parse_ktx(ddsktx_texture_info* tc, const void* file_data, int size, ddsktx_error* err)
 {
     static const uint8_t ktx__id[] = { 0x20, 0x31, 0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A };
@@ -969,10 +1108,26 @@ static bool ddsktx__parse_ktx(ddsktx_texture_info* tc, const void* file_data, in
     tc->num_mips = ddsktx__max((int)header.mip_count, 1);
     tc->bpp = k__block_info[format].bpp;
 
+    if (tc->width <= 0 || tc->height <= 0 || tc->depth <= 0) {
+        ddsktx__err(err, "ktx: invalid texture dimensions");
+    }
+    if (tc->num_mips > ddsktx__max_mips(tc->width, tc->height, tc->depth)) {
+        ddsktx__err(err, "ktx: mip count exceeds texture dimensions");
+    }
+    if (tc->num_layers < 1) {
+        ddsktx__err(err, "ktx: invalid array count");
+    }
+
     if (header.face_count == 6)
         tc->flags |= DDSKTX_TEXTURE_FLAG_CUBEMAP;
+    if (tc->depth > 1)
+        tc->flags |= DDSKTX_TEXTURE_FLAG_VOLUME;
     tc->flags |= k__formats_info[format].has_alpha ? DDSKTX_TEXTURE_FLAG_ALPHA : 0;
     tc->flags |= DDSKTX_TEXTURE_FLAG_KTX;
+
+    if (!ddsktx__validate_ktx_layout(tc, file_data, size, err)) {
+        return false;
+    }
 
     return true;
 }
@@ -1002,7 +1157,9 @@ static bool ddsktx__parse_dds(ddsktx_texture_info* tc, const void* file_data, in
         header.pixel_format.fourcc == DDSKTX__DDS_DX10)
     {
         ddsktx__dds_header_dxgi dxgi_header;
-        ddsktx__read(&r, &dxgi_header, sizeof(dxgi_header));
+        if (ddsktx__read(&r, &dxgi_header, sizeof(dxgi_header)) != sizeof(dxgi_header)) {
+            ddsktx__err(err, "dds: unexpected end of file while reading DX10 header");
+        }
         dxgi_format = dxgi_header.dxgi_format;
         array_size = dxgi_header.array_size;
     }
@@ -1071,6 +1228,20 @@ static bool ddsktx__parse_dds(ddsktx_texture_info* tc, const void* file_data, in
     tc->num_layers = ddsktx__max(1, (int)array_size);
     tc->num_mips = (header.caps1 & DDSKTX__DDSCAPS_MIPMAP) ? (int)header.mip_count : 1;
     tc->bpp = k__block_info[format].bpp;
+
+    if (tc->width <= 0 || tc->height <= 0 || tc->depth <= 0) {
+        ddsktx__err(err, "dds: invalid texture dimensions");
+    }
+    if (tc->num_mips <= 0 || tc->num_mips > ddsktx__max_mips(tc->width, tc->height, tc->depth)) {
+        ddsktx__err(err, "dds: invalid mip count");
+    }
+    if (tc->num_layers <= 0) {
+        ddsktx__err(err, "dds: invalid array size");
+    }
+    if (cubemap && tc->depth != 1) {
+        ddsktx__err(err, "dds: texture cannot be both cubemap and 3D volume");
+    }
+
     if (has_alpha || k__formats_info[format].has_alpha)
         tc->flags |= DDSKTX_TEXTURE_FLAG_ALPHA;
     if (!has_alpha && k__formats_info[format].has_alpha)
@@ -1079,14 +1250,18 @@ static bool ddsktx__parse_dds(ddsktx_texture_info* tc, const void* file_data, in
         tc->flags |= DDSKTX_TEXTURE_FLAG_CUBEMAP;
     if (volume)
         tc->flags |= DDSKTX_TEXTURE_FLAG_VOLUME;
-    if (srgb) 
+    if (srgb)
         tc->flags |= DDSKTX_TEXTURE_FLAG_SRGB;
     tc->flags |= DDSKTX_TEXTURE_FLAG_DDS;
+
+    if (!ddsktx__validate_dds_layout(tc, err)) {
+        return false;
+    }
 
     return true;
 }   
 
-void ddsktx_get_sub(const ddsktx_texture_info* tc, ddsktx_sub_data* sub_data, 
+void ddsktx_get_sub(const ddsktx_texture_info* tc, ddsktx_sub_data* sub_data,
                     const void* file_data, int size,
                     int array_idx, int slice_face_idx, int mip_idx)
 {
@@ -1099,154 +1274,107 @@ void ddsktx_get_sub(const ddsktx_texture_info* tc, ddsktx_sub_data* sub_data,
     ddsktx_assert(!(!(tc->flags&DDSKTX_TEXTURE_FLAG_CUBEMAP) && (slice_face_idx >= tc->depth)) && "invalid depth-slice index");
     ddsktx_assert(mip_idx < tc->num_mips);
 
-    ddsktx__mem_reader r = { (uint8_t*)file_data, size, tc->data_offset };
+    ddsktx_memset(sub_data, 0x0, sizeof(*sub_data));
+
+    ddsktx__mem_reader r = { (const uint8_t*)file_data, size, tc->data_offset };
     ddsktx_format format = tc->format;
 
     ddsktx_assert(format < _DDSKTX_FORMAT_COUNT && format != _DDSKTX_FORMAT_COMPRESSED);
-    const ddsktx__block_info* binfo = &k__block_info[format];
-    const int bpp          = binfo->bpp;
-    const int block_size   = binfo->block_size;
-    const int min_block_x  = binfo->min_block_x;
-    const int min_block_y  = binfo->min_block_y;
-
-    int num_faces;
 
     ddsktx_assert(!((tc->flags & DDSKTX_TEXTURE_FLAG_CUBEMAP) && tc->depth > 1) && "textures must be either Cube or 3D");
-    int slice_idx, face_idx, num_slices;
+    int slice_idx, face_idx, num_faces;
     if (tc->flags & DDSKTX_TEXTURE_FLAG_CUBEMAP) {
         slice_idx = 0;
         face_idx = slice_face_idx;
         num_faces = DDSKTX_CUBE_FACE_COUNT;
-        num_slices = 1;
     } else {
         slice_idx = slice_face_idx;
         face_idx = 0;
         num_faces = 1;
-        num_slices = tc->depth;
-    }    
+    }
 
     if (tc->flags & DDSKTX_TEXTURE_FLAG_DDS) {
+        // DDS layout: array-layer -> cube-face -> mip -> depth-slice, tightly packed.
         for (int layer = 0, num_layers = tc->num_layers; layer < num_layers; layer++) {
             for (int face = 0; face < num_faces; face++) {
-                int width = tc->width;
-                int height = tc->height;
-
                 for (int mip = 0, mip_count = tc->num_mips; mip < mip_count; mip++) {
-                    int row_bytes, mip_size;
-                    
-                    if (format < _DDSKTX_FORMAT_COMPRESSED) {
-                        int num_blocks_wide = width > 0 ? ddsktx__max(1, (width + 3)/4) : 0;
-                        num_blocks_wide = ddsktx__max(min_block_x, num_blocks_wide);
+                    int width = ddsktx__mip_dim(tc->width, mip);
+                    int height = ddsktx__mip_dim(tc->height, mip);
+                    int num_slices = (tc->flags & DDSKTX_TEXTURE_FLAG_VOLUME)
+                                   ? ddsktx__mip_dim(tc->depth, mip) : 1;
+                    ddsktx__footprint fp = ddsktx__calc_footprint(format, width, height);
 
-                        int num_blocks_high = height > 0 ? ddsktx__max(1, (height + 3)/4) : 0;
-                        num_blocks_high = ddsktx__max(min_block_y, num_blocks_high);
-
-                        row_bytes = num_blocks_wide * block_size;
-                        mip_size = row_bytes * num_blocks_high;
-                    } else {
-                        row_bytes = (width*bpp + 7)/8;  // round to nearest byte
-                        mip_size = row_bytes * height;
-                    }
-                   
                     for (int slice = 0; slice < num_slices; slice++) {
-                        if ((r.offset + mip_size) > r.total) {
+                        if ((int64_t)r.offset + fp.slice_size_bytes > r.total) {
                             ddsktx_assert(false && "texture buffer overflow");
-                            ddsktx_memset(sub_data, 0x0, sizeof(*sub_data));
                             return;
                         }
 
-                        if (layer == array_idx && mip == mip_idx && 
-                            slice == slice_idx && face_idx == face) 
+                        if (layer == array_idx && mip == mip_idx &&
+                            slice == slice_idx && face_idx == face)
                         {
-                            if ((r.offset + mip_size) > r.total) {
-                                sub_data->buff = NULL;
-                                return;
-                            }
-
                             sub_data->buff = r.buff + r.offset;
                             sub_data->width = width;
                             sub_data->height = height;
-                            sub_data->size_bytes = mip_size;
-                            sub_data->row_pitch_bytes = row_bytes;
+                            sub_data->size_bytes = (int)fp.slice_size_bytes;
+                            sub_data->row_pitch_bytes = (int)fp.row_pitch_bytes;
                             return;
                         }
 
-                        r.offset += mip_size;
+                        r.offset += (int)fp.slice_size_bytes;
                     } // foreach slice
-
-                    width >>= 1;
-                    height >>= 1;
-
-                    if (width == 0) {
-                        width = 1;
-                    }
-                    if (height == 0) {
-                        height = 1;
-                    }
                 }   // foreach mip
             }   // foreach face
         } // foreach array-item
     } else if (tc->flags & DDSKTX_TEXTURE_FLAG_KTX) {
-        int width = tc->width;
-        int height = tc->height;
-
+        // KTX layout: mip -> (uint32 imageSize) -> array-layer -> cube-face ->
+        //             depth-slice. imageSize is the per-face stride and may
+        //             include up to 3 bytes of 4-byte padding; the sub data
+        //             itself is tightly packed at the start of that stride.
         for (int mip = 0, c = tc->num_mips; mip < c; mip++) {
-            int row_bytes, mip_size;
+            int width = ddsktx__mip_dim(tc->width, mip);
+            int height = ddsktx__mip_dim(tc->height, mip);
+            int num_slices = (tc->flags & DDSKTX_TEXTURE_FLAG_VOLUME)
+                           ? ddsktx__mip_dim(tc->depth, mip) : 1;
+            ddsktx__footprint fp = ddsktx__calc_footprint(format, width, height);
+            int64_t face_size = fp.slice_size_bytes * num_slices;
 
-            if (format < _DDSKTX_FORMAT_COMPRESSED) {
-                int num_blocks_wide = width > 0 ? ddsktx__max(1, (width + 3)/4) : 0;
-                num_blocks_wide = ddsktx__max(min_block_x, num_blocks_wide);
-
-                int num_blocks_high = height > 0 ? ddsktx__max(1, (height + 3)/4) : 0;
-                num_blocks_high = ddsktx__max(min_block_y, num_blocks_high);
-
-                row_bytes = num_blocks_wide * block_size;
-                mip_size = row_bytes * num_blocks_high;
+            uint32_t image_size = 0;
+            if (ddsktx__read(&r, &image_size, sizeof(image_size)) != sizeof(image_size)) {
+                ddsktx_assert(false && "texture buffer overflow");
+                return;
             }
-            else {
-                row_bytes = (width*bpp + 7)/8;  // round to nearest byte
-                mip_size = row_bytes * height;
-            }
-
-            int image_size;
-            ddsktx__read(&r, &image_size, sizeof(image_size)); 
-            ddsktx_assert(image_size == (mip_size*num_faces*num_slices) && "image size mismatch");
+            // Parse already validated face_size <= image_size <= align4(face_size).
+            ddsktx_assert((int64_t)image_size >= face_size && "image size mismatch");
 
             for (int layer = 0, num_layers = tc->num_layers; layer < num_layers; layer++) {
                 for (int face = 0; face < num_faces; face++) {
+                    // Tightly packed slices live at the start of this face stride.
                     for (int slice = 0; slice < num_slices; slice++) {
+                        if ((int64_t)r.offset + fp.slice_size_bytes > r.total) {
+                            ddsktx_assert(false && "texture buffer overflow");
+                            return;
+                        }
+
                         if (layer == array_idx && mip == mip_idx &&
-                            slice == slice_idx && face_idx == face) 
+                            slice == slice_idx && face_idx == face)
                         {
                             sub_data->buff = r.buff + r.offset;
                             sub_data->width = width;
                             sub_data->height = height;
-                            sub_data->size_bytes = mip_size;
-                            sub_data->row_pitch_bytes = row_bytes;
+                            sub_data->size_bytes = (int)fp.slice_size_bytes;
+                            sub_data->row_pitch_bytes = (int)fp.row_pitch_bytes;
                             return;
                         }
 
-                        r.offset += mip_size;
-                        ddsktx_assert(r.offset <= r.total && "texture buffer overflow");
+                        r.offset += (int)fp.slice_size_bytes;
                     }   // foreach slice
 
-                    
-                    r.offset = ddsktx__align_mask(r.offset, 3); // cube-padding
+                    // Skip any padding and move to the next face/layer stride.
+                    r.offset += (int)((int64_t)image_size - face_size);
                 }   // foreach face
             }   // foreach array-item
-
-            width >>= 1;
-            height >>= 1;
-
-            if (width == 0) {
-                width = 1;
-            }
-            if (height == 0) {
-                height = 1;
-            }
-            
-            r.offset = ddsktx__align_mask(r.offset, 3); // mip-padding
-        }   // foreach mip     
+        }   // foreach mip
     } else {
         ddsktx_assert(0 && "invalid file format");
     }
